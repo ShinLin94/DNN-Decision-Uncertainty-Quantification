@@ -8,7 +8,7 @@ class DualBackboneHPA(nn.Module):
     def __init__(self, num_classes=19):
         super(DualBackboneHPA, self).__init__()
 
-        # # If using 4 channels
+        # # If using 4 channels (requires training)
         # # ResNet backbone
         # self.resnet = models.resnet18(weights=None)
         # # Modify first conv to accept 4-channel input (RGBY)
@@ -27,7 +27,7 @@ class DualBackboneHPA(nn.Module):
         #     nn.Linear(512 + 1536, num_classes)
         # )
 
-        # standard 3 channels
+        # standard 3 channels (using pretrained weights)
         # ResNet backbone with 19-class head
         self.resnet = models.resnet18(weights=None)
         self.resnet.fc = nn.Linear(512, num_classes)  # Shape matches [19, 512]
@@ -38,15 +38,6 @@ class DualBackboneHPA(nn.Module):
             nn.Dropout(p=0.3, inplace=True),
             nn.Linear(1536, num_classes)              # Shape matches [19, 1536]
         )
-
-    # def forward(self, x):
-    #     # Obtain predictions from both backbones (each outputs shape: [batch_size, 19])
-    #     res_logits = self.resnet(x)
-    #     eff_logits = self.effnet(x)
-        
-    #     # Ensemble / average the predictions 50:50
-    #     out = (res_logits + eff_logits) / 2.0
-    #     return out # returns logits
     
     def forward(self, x):
         # Obtain predictions from both backbones (each outputs shape: [batch_size, 19])
@@ -54,7 +45,7 @@ class DualBackboneHPA(nn.Module):
         eff_probs = torch.sigmoid(self.effnet(x))
 
         # Avg predictions
-        return (res_probs + eff_probs) / 2.0  # returns probabilities, not logits
+        return (res_probs + eff_probs) / 2.0  # returns probabilities, not logits (get rid of sigmoid to get logits)
 
 def load_hpa_sample_4to3(image_id, data_dir):
     """Combines 4 HPA color filters into a 3-channel RGB image normalized to [0, 1]."""
@@ -88,3 +79,11 @@ def load_hpa_sample_4to3(image_id, data_dir):
     # Convert to PyTorch float tensor (3, H, W) normalized to [0, 1]
     tensor_img = torch.from_numpy(rgb_image).permute(2, 0, 1).float() / 255.0
     return tensor_img
+
+
+def parse_labels_to_multihot(label_str, num_classes=19):
+    """Converts '16|13' into a 19-dim multi-hot vector."""
+    indices = [int(x) for x in label_str.split('|')]
+    vec = np.zeros(num_classes, dtype=np.float32)
+    vec[indices] = 1.0
+    return vec
