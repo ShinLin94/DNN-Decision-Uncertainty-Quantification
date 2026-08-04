@@ -17,16 +17,34 @@ import numpy as np
 # from torch.utils.data import TensorDataset, DataLoader
 
 from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import f1_score
 
 
-def shanon_stability(cat_all, output_dim):
+def find_best_thresholds(probs, labels, thresholds=np.arange(0.05, 0.95, 0.05)):
+    """probs, labels: (N, num_classes) numpy arrays"""
+    best_thresholds = np.zeros(probs.shape[1])
+    for c in range(probs.shape[1]):
+        best_f1, best_t = 0, 0.5
+        for t in thresholds:
+            preds_c = (probs[:, c] > t).astype(int)
+            f1 = f1_score(labels[:, c], preds_c, zero_division=0)
+            if f1 > best_f1:
+                best_f1, best_t = f1, t
+        best_thresholds[c] = best_t
+
+    # returns best thresholds for each class (output_dim,1)
+    return best_thresholds
+
+
+def shanon_stability_multilabel(cat_all, cats):   
     # cat_all.shape = (len(X), output_dim)
-    # get % of a point being classified as a class
-    cat_all = cat_all / cat_all.sum(dim=1).unsqueeze(1)
+    # get % of a class being classified as positive for a point
+    cat_all = cat_all / cats
 
-    # stability of each point on grid from Shannon formula (len(X), 1)
+    # stability of each class (binary prob) for each point on grid from Shannon formula (len(X), output_dim)
     # elementwise mult -> cat_all * torch.log(cat_all + 1e-10) 
-    stability = 1 + torch.sum(cat_all * torch.log(cat_all + 1e-10) / np.log(output_dim), dim=1)
+    stabilities = 1 + (cat_all * torch.log(cat_all + 1e-10) + (1 - cat_all) * torch.log(1 - cat_all + 1e-10)) / np.log(2)
+    stability = stabilities.mean(dim=1)
 
     return stability.detach().cpu().numpy()
 
