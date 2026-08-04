@@ -1,0 +1,11 @@
+*.pth
+__pycache__/
+data/
+myenv/
+train.csv
+train_subset.csv
+*.log
+*.png
+models/
+plots/
+*.csv
