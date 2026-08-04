@@ -5,8 +5,8 @@
 # In[3]:
 from confidence_functions import *
 
-# import torch
-# import torch.nn as nn
+import torch
+import torch.nn as nn
 from torch import optim
 from torch.utils.data import Dataset, DataLoader
 
@@ -18,6 +18,7 @@ import os
 
 from PIL import Image
 import pandas as pd
+import numpy as np
 
 from skmultilearn.model_selection import iterative_train_test_split
 import matplotlib.pyplot as plt
@@ -149,7 +150,7 @@ image_paths = [
     os.path.join(cell_dir, f"{im_id}_{cell_id}.jpg")
     for im_id, cell_id in zip(df['image_id'], df['cell_id'])
 ]
-len(image_paths)
+print(f"Found {len(image_paths)} image paths")
 
 
 # In[ ]:
@@ -165,21 +166,24 @@ for i, label_str in enumerate(df['image_labels']):
 
 
 # Load then transform and save all images to a cached file
-
 cache_path = 'cached_data.pt'
 if os.path.exists(cache_path):
+    print(f"Loading cached data from {cache_path}")
     cache = torch.load(cache_path)
     all_imgs = cache['images']
     all_labels = cache['labels']
 else:
+    print(f"Creating cached data at {cache_path}")
     all_imgs = torch.stack([transform(Image.open(p).convert('RGB')) for p in image_paths])
     all_labels = torch.tensor(multihot_labels, dtype=torch.float32)
     torch.save({'images': all_imgs, 'labels': all_labels}, cache_path)
-
+    
+print(f"Cached data loaded with {all_imgs.shape[0]} images and {all_labels.shape[0]} labels")
 
 # In[ ]:
 
 
+print("Splitting data into train and test sets")
 X = np.arange(len(df)).reshape(-1, 1)  # just indices of images
 y = np.array(multihot_labels)  # (174000, 19)
 
@@ -192,6 +196,9 @@ test_indices = X_test.flatten()
 
 train_imgs, train_labels = all_imgs[train_indices], all_labels[train_indices]
 test_imgs, test_labels = all_imgs[test_indices], all_labels[test_indices]
+
+print(f"Train set: {train_imgs.shape[0]} images, {train_labels.shape[0]} labels")
+print(f"Test set: {test_imgs.shape[0]} images, {test_labels.shape[0]} labels")
 
 
 # In[ ]:
@@ -226,19 +233,19 @@ class CachedCellDataset(Dataset):
         return len(self.images)
 
     def __getitem__(self, idx):
-        return self.images[idx], self.labels[idx]  # just indexing, no disk I/O, no transform
+        return self.images[idx], self.labels[idx]  # just indexing
 
 
 # In[ ]:
 
-
+print("Create dataset objects")
 # create Dataset object using the CellDataset class
 train_dataset = CachedCellDataset(train_imgs, train_labels)
 test_dataset = CachedCellDataset(test_imgs, test_labels)
 
 # pass object into DataLoader (Make batch_size higher if you are using GPU for faster speed)
-train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, num_workers=2)
-test_loader = DataLoader(test_dataset, batch_size=len(test_dataset), shuffle=True, num_workers=2)
+train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=len(test_dataset), shuffle=True)
 
 
 # ## Train Model
@@ -246,7 +253,7 @@ test_loader = DataLoader(test_dataset, batch_size=len(test_dataset), shuffle=Tru
 # In[ ]:
 
 
-def train_model(n_epochs, train_loader, test_loader, cat100=True, output_dim=19):   
+def train_model(n_epochs, train_loader, test_loader, pos_weight, cat100=True, output_dim=19):   
     
     # use pretrained resnet18 model
     model = models.resnet18(weights='IMAGENET1K_V1')
@@ -260,7 +267,7 @@ def train_model(n_epochs, train_loader, test_loader, cat100=True, output_dim=19)
     model.fc = nn.Linear(512, 19)
     model.to(device)
     
-    criterion = nn.BCEWithLogitsLoss()
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     optimizer = optim.Adam(model.parameters(), lr=5e-4)
 
     # cat_last = None 
@@ -295,7 +302,10 @@ def train_model(n_epochs, train_loader, test_loader, cat100=True, output_dim=19)
                     cat_next = logits.argmax(dim=1)
                     for c in range(output_dim):
                         cat_all[cat_next == c, c] += 1
-                            
+
+            if itr % 100 == 0:
+                print(f"Epoch: {epo} | Iteration: {itr} | Loss: {loss.item()}")
+                           
         print(f"Epoch: {epo} | Loss: {loss.item()}")
 
 
@@ -307,22 +317,23 @@ def train_model(n_epochs, train_loader, test_loader, cat100=True, output_dim=19)
     # calculate means and variances for mahalanobis
     stats = compute_class_means_and_covariance(model, train_loader, output_dim , device)
 
-    return model, stab, prob, stats, test_labels#, loss_history
+    return model, stab, prob, stats, y#, loss_history
 
 
 # In[ ]:
 
-
-model, stab, prob, stats, test_labels = train_model(10, train_loader, test_loader)
+pos_weight = torch.tensor([ torch.log(len(train_imgs) / (class_count + 1)) for class_count in class_appear_counts], dtype=torch.float32).to(device)
+print("Start training model")
+model, stab, prob, stats, test_labels = train_model(1, train_loader, test_loader, pos_weight, cat100=True, output_dim=19)
 
 # In[ ]:
 
 
-torch.save({'model': model}, 'model_resnet18_layer4_50x50.pt')
-torch.save({'stability': stab}, 'stability_resnet18_layer4_50x50.pt')
-torch.save({'prob': prob}, 'sigmoid_resnet18_layer4_50x50.pt')
-torch.save({'test_labels': y}, 'test_labels_resnet18_layer4_50x50.pt')
-torch.save({'stats': stats}, 'stats_resnet18_layer4_50x50.pt')
+torch.save({'model': model}, 'model_resnet18_layer4_50x50_1ep.pt')
+torch.save({'stability': stab}, 'stability_resnet18_layer4_50x50_1ep.pt')
+torch.save({'prob': prob}, 'sigmoid_resnet18_layer4_50x50_1ep.pt')
+torch.save({'test_labels': test_labels}, 'test_labels_resnet18_layer4_50x50_1ep.pt')
+torch.save({'stats': stats}, 'stats_resnet18_layer4_50x50_1ep.pt')
 
 # 
 
