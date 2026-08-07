@@ -4,15 +4,16 @@ from sklearn.metrics import (
     f1_score, precision_score, recall_score,
     average_precision_score, classification_report
 )
+from confidence_functions import *
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-BASE_DIR = '/gpfs/projects/b1042/AmaralLab/shin/DNN-Decision-Uncertainty-Quantification'
-SIGMOID_PATH = f'{BASE_DIR}/sigmoid_resnet18_layer4_50x50.pt'
-LABELS_PATH = f'{BASE_DIR}/test_labels_resnet18_layer4_50x50.pt'
+BASE_DIR = '/gpfs/projects/b1042/AmaralLab/shin/DNN-Decision-Uncertainty-Quantification/models'
+SIGMOID_PATH = f'{BASE_DIR}/sigmoid_resnet18_224x224_8ep.pt'
+LABELS_PATH = f'{BASE_DIR}/test_labels_resnet18_224x224_8ep.pt'
 NUM_CLASSES = 19
-THRESHOLD = 0.5 # change this for different decision thresholds of the sigmoid output
+THRESHOLD = np.array([0.5] * NUM_CLASSES)  # change this for different decision thresholds of the sigmoid output
 
 
 # Load saved probabilities and labels 
@@ -20,7 +21,8 @@ probs = torch.load(SIGMOID_PATH, map_location='cpu')['sigmoid'].numpy()      # (
 labels = torch.load(LABELS_PATH, map_location='cpu')['test_labels'].numpy()  # (N, 19)
  
 print(f"Loaded {probs.shape[0]} test samples, {probs.shape[1]} classes")
- 
+
+THRESHOLD = find_best_threshold(probs, labels)
 preds = (probs > THRESHOLD).astype(np.float32)
 
 

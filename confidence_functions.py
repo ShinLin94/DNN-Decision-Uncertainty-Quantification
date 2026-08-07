@@ -1,9 +1,11 @@
+
 import torch
 from torch import nn
 # from torch import optim
 # from torch.nn.utils import parameters_to_vector
-# from torch.nn.functional import gelu
+# from torch.nn.functional import gelu, relu
 
+from PIL import Image
 import numpy as np
 # import matplotlib.pyplot as plt
 # from tqdm import tqdm
@@ -14,10 +16,17 @@ import numpy as np
 # from helpers import *
 
 # from collections import deque
-# from torch.utils.data import TensorDataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, TensorDataset
+import torchvision
+import torchvision.transforms as T
 
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import f1_score
+
+IMG_SIZE = 224  
+NORM_MEAN = (0.0, 0.0, 0.0) #
+NORM_STD = (0.0, 0.0, 0.0) # will be computed from training set
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def find_best_thresholds(probs, labels, thresholds=np.arange(0.05, 0.95, 0.05)):
@@ -48,7 +57,7 @@ def shanon_stability_multilabel(cat_all, cats):
 
     return stability.detach().cpu().numpy()
 
-def get_features(model, x, layer_types=(nn.GELU,), detach=True): 
+def get_features(model, x, layer_types=(nn.GELU, nn.ReLU), detach=True): 
     """ 
     Change nn.Linear to switch feature layer to extract (features before activation fn)
     Or if use other layer types (RELU,GELU,...etc)
@@ -81,7 +90,7 @@ def get_features(model, x, layer_types=(nn.GELU,), detach=True):
 
     return features
 
-def compute_class_means_and_covariance(model, train_loader, num_classes, device):
+def compute_class_means_and_covariance(model, train_loader, num_classes, device=DEVICE):
     model.eval()
     feats_per_layer = {}
     labels_all = []
@@ -104,7 +113,7 @@ def compute_class_means_and_covariance(model, train_loader, num_classes, device)
 
     return stats
 
-def compute_alpha(model, X_pos, X_neg, stats, device):
+def compute_alpha(model, X_pos, X_neg, stats, device=DEVICE):
     """
     X_indist: [N1, input_dim] in-distribution validation samples
     X_ood: [N2, input_dim] OOD or adversarial validation samples
@@ -138,7 +147,7 @@ def compute_alpha(model, X_pos, X_neg, stats, device):
     return [clf.coef_.flatten(), clf.intercept_.item()]
 
 
-def mohalanobis(X, model, stats, alpha, device, eps=1e-5):
+def mohalanobis(X, model, stats, alpha, device=DEVICE, eps=1e-5):
     model.eval()
     # alpha = torch.as_tensor(alpha, dtype=torch.float32)
 
@@ -185,4 +194,162 @@ def mohalanobis(X, model, stats, alpha, device, eps=1e-5):
     final_prob = torch.sigmoid(final) 
 
     return final_prob    
-            
+
+
+def compute_dataset_stats(images_uint8_or_float, already_scaled_0_1=False, chunk_size=6000):
+    """
+    Computes per-channel mean/std over your training set, in chunks, so it
+    never materializes the full tensor as float32 at once (a 156k x 3 x 224 x 224
+    uint8 tensor is ~24GB; converting the whole thing to float32 is ~94GB and
+    will OOM on most nodes).
+ 
+    images_uint8_or_float: tensor of shape (N, 3, H, W), either uint8 [0,255]
+        or float already in [0,1] (set already_scaled_0_1=True in that case).
+    """
+    n = images_uint8_or_float.shape[0]
+    channels = images_uint8_or_float.shape[1]
+ 
+    # Welford-style running sums, computed per chunk to bound memory
+    sum_ = torch.zeros(channels, dtype=torch.float64)
+    sum_sq = torch.zeros(channels, dtype=torch.float64)
+    count = 0
+ 
+    for start in range(0, n, chunk_size):
+        end = min(start + chunk_size, n)
+        chunk = images_uint8_or_float[start:end].float()
+        if not already_scaled_0_1:
+            chunk = chunk / 255.0
+ 
+        # sum over batch, height, width -> per-channel totals
+        pixels_per_channel = chunk.shape[0] * chunk.shape[2] * chunk.shape[3]
+        sum_ += chunk.sum(dim=(0, 2, 3)).double()
+        sum_sq += (chunk ** 2).sum(dim=(0, 2, 3)).double()
+        count += pixels_per_channel
+ 
+        del chunk  # free this chunk's float memory before the next iteration
+ 
+    mean = sum_ / count
+    # var = E[x^2] - E[x]^2
+    var = (sum_sq / count) - (mean ** 2)
+    std = torch.sqrt(var)
+ 
+    return tuple(mean.float().tolist()), tuple(std.float().tolist())
+
+def get_cifar10_ood_loader(root="./data", batch_size=64, train=False,
+                            num_workers=2, download=True):
+    """
+    Loads CIFAR-10 resized/normalized to match the in-distribution HPA pipeline.
+    Returns a DataLoader yielding (image, label) — label is CIFAR's class id,
+    which we will ignore since these are only used as OOD negatives.
+    """
+    transform = T.Compose([
+        T.Resize((IMG_SIZE, IMG_SIZE)),
+        T.ToTensor(),
+        T.Normalize(mean=NORM_MEAN, std=NORM_STD),
+    ])
+
+    dataset = torchvision.datasets.CIFAR10(
+        root=root, train=train, download=download, transform=transform
+    )
+
+    return DataLoader(dataset, batch_size=batch_size, shuffle=False,
+                       num_workers=num_workers, pin_memory=True)
+
+
+class NoiseDataset(Dataset):
+    """
+    Generates random noise images on the fly. `mode` controls the noise
+    distribution:
+      - "gaussian": N(0, 1) then normalized like real data
+      - "uniform":  U(0, 1) then normalized like real data
+    """
+    def __init__(self, n_samples=2000, img_size=IMG_SIZE, channels=3,
+                 mode="gaussian", mean=NORM_MEAN, std=NORM_STD, seed=None):
+        self.n_samples = n_samples
+        self.img_size = img_size
+        self.channels = channels
+        self.mode = mode
+        self.mean = torch.tensor(mean).view(-1, 1, 1)
+        self.std = torch.tensor(std).view(-1, 1, 1)
+        self.generator = torch.Generator()
+        if seed is not None:
+            self.generator.manual_seed(seed)
+
+    def __len__(self):
+        return self.n_samples
+
+    def __getitem__(self, idx):
+        shape = (self.channels, self.img_size, self.img_size)
+        if self.mode == "gaussian":
+            # centered at 0.5 like real [0,1] pixel intensities,
+            # std=0.25 keeps ~95% of values inside [0,1]; clamp handles the tails
+            img = torch.randn(shape, generator=self.generator) * 0.25 + 0.5 
+            img = torch.clamp(img, 0, 1)
+            img = (img - self.mean) / self.std 
+        elif self.mode == "uniform":
+            img = torch.rand(shape, generator=self.generator)  # [0, 1]
+            img = (img - self.mean) / self.std
+        else:
+            raise ValueError(f"Unknown noise mode: {self.mode}")
+        label = -1  # sentinel label, these have no real class
+        return img, label
+
+
+def get_noise_ood_loader(n_samples=2000, batch_size=64, img_size=IMG_SIZE,
+                          channels=3, mode="gaussian", num_workers=2, seed=None):
+    dataset = NoiseDataset(n_samples=n_samples, img_size=img_size,
+                            channels=channels, mode=mode, seed=seed)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=False,
+                       num_workers=num_workers, pin_memory=True)
+
+
+def fgsm_attack(model, images, labels, epsilon, criterion=nn.BCEWithLogitsLoss(), device=DEVICE):
+    """
+    Single-step FGSM: x_adv = x + epsilon * sign(grad_x L(model(x), y))
+    `images` should already be normalized the same way as your training data.
+    `labels` should be the ground-truth (or predicted, if unlabeled) targets —
+    for multi-label HPA data, use BCEWithLogitsLoss and multi-hot labels.
+    """
+
+    images = images.clone().detach().to(device).requires_grad_(True)
+    labels = labels.to(device)
+
+    model.eval()
+    outputs = model(images)
+    loss = criterion(outputs, labels.float())
+
+    model.zero_grad()
+    loss.backward()
+
+    with torch.no_grad():
+        perturbation = epsilon * images.grad.sign()
+        adv_images = images + perturbation
+        # NOTE: no clamp to [0,1] here since inputs are already normalized;
+        # if you need pixel-space clamping, unnormalize -> clamp -> renormalize.
+
+    return adv_images.detach().cpu()
+
+
+def get_adversarial_loader(model, in_dist_loader, epsilon=0.02, device=DEVICE, criterion=nn.BCEWithLogitsLoss(), max_batches=None):
+    """
+    Runs FGSM over an existing in-distribution DataLoader and returns a new
+    DataLoader of adversarial examples (same batch_size as input loader).
+    This is your alpha_adv negative set for the Mahalanobis detector.
+    """
+    model = model.to(device)
+    adv_images_list, labels_list = [], []
+
+    for i, (images, labels) in enumerate(in_dist_loader):
+        if max_batches is not None and i >= max_batches:
+            break
+        adv_batch = fgsm_attack(model, images, labels, epsilon,
+                                 criterion=criterion, device=device)
+        adv_images_list.append(adv_batch)
+        labels_list.append(labels)
+
+    adv_images_tensor = torch.cat(adv_images_list, dim=0)
+    labels_tensor = torch.cat(labels_list, dim=0)
+
+    adv_dataset = TensorDataset(adv_images_tensor, labels_tensor)
+    return DataLoader(adv_dataset, batch_size=in_dist_loader.batch_size,
+                       shuffle=False, pin_memory=True)

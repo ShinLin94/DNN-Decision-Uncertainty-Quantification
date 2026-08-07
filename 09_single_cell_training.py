@@ -136,27 +136,6 @@ print(f"appear count of class 18: {class_appear_counts.values[18]}")
 print(f"appear count of class 11: {class_appear_counts.values[11]}")
 
 
-# ## Resize and Split data
-
-# In[ ]:
-
-
-# transform = transforms.Compose([
-#     transforms.Resize((128, 128)),  # very low resolution, but faster this way
-#     transforms.ToTensor(),
-# ])
-
-
-# In[ ]:
-
-
-# image_paths = [
-#     os.path.join(cell_dir, f"{im_id}_{cell_id}.jpg")
-#     for im_id, cell_id in zip(df['image_id'], df['cell_id'])
-# ]
-# print(f"Found {len(image_paths)} image paths")
-
-
 # In[ ]:
 
 
@@ -182,7 +161,6 @@ else:
     
 print(f"Cached data loaded with {all_imgs.shape[0]} images and {all_labels.shape[0]} labels")
 
-
 # In[ ]:
 
 
@@ -197,6 +175,9 @@ X_train, y_train, X_test, y_test = iterative_train_test_split(X, y, test_size=0.
 train_indices = X_train.flatten()
 test_indices = X_test.flatten()
 
+# save train and test indices to disk for reproducibility
+torch.save({'train_indices': train_indices, 'test_indices': test_indices}, 'train_test_indices.pt')
+
 train_imgs, train_labels = all_imgs[train_indices], all_labels[train_indices]
 test_imgs, test_labels = all_imgs[test_indices], all_labels[test_indices]
 
@@ -206,37 +187,26 @@ print(f"Test set: {test_imgs.shape[0]} images, {test_labels.shape[0]} labels")
 
 # In[ ]:
 
-
-# # use this class to load images as requested if there is no disk space
-# class CellDataset(Dataset):
-#     def __init__(self, image_paths, labels, transform):
-#         self.image_paths = image_paths
-#         self.labels = labels  # list of multi-hot vectors (or something convertible to one), one per image
-#         self.transform = transform
-
-#     def __len__(self):
-#         return len(self.image_paths)
-
-#     def __getitem__(self, idx):
-#         img = Image.open(self.image_paths[idx]).convert('RGB')
-#         img = self.transform(img)
-#         label = torch.tensor(self.labels[idx], dtype=torch.float32)  # float, multi-hot
-#         return img, label
-
+# find mean and std of the training set for normalization
+NORM_MEAN, NORM_STD = compute_dataset_stats(train_imgs, already_scaled_0_1=False)
+print(f"Computed mean: {NORM_MEAN}, std: {NORM_STD} for normalization of training set")
 
 # In[ ]:
 
 
 class CachedCellDataset(Dataset):
-    def __init__(self, images, labels):
-        self.images = images  # already-transformed tensor, shape (N, 3, resized_height, resized_width)
-        self.labels = labels  # already a tensor, shape (N, 19)
+    def __init__(self, images, labels, mean=NORM_MEAN, std=NORM_STD):
+        self.images = images
+        self.labels = labels
+        self.mean = torch.tensor(mean).view(-1, 1, 1)
+        self.std = torch.tensor(std).view(-1, 1, 1)
 
     def __len__(self):
         return len(self.images)
 
     def __getitem__(self, idx):
         img = self.images[idx].float() / 255.0
+        img = (img - self.mean) / self.std   # <-- normalization added here
         return img, self.labels[idx]
 
 
@@ -279,22 +249,21 @@ def train_model(n_epochs, train_loader, test_loader, pos_weight, threshold=0.5, 
     optimizer = optim.Adam(model.parameters(), lr=5e-5)
     # optimizer = optim.Adam(model.parameters(), lr=5e-4, weight_decay=1e-4)
 
-    # # cat_last = None 
-    # # perc_change = [] 
-    # X, y = next(iter(test_loader))
-    # cat_all = torch.zeros(len(X), output_dim).to(device)
+    X, y = next(iter(test_loader))
+    X, y = X.to(device), y.to(device) 
+    cat_all = torch.zeros(len(X), output_dim).to(device)
     loss_history = []
 
-    # # start calculating cat_all for the last 100 iterations
-    # total_iterations = n_epochs * len(train_loader)
-    # target_iteration = total_iterations - cats if cats is not None else 0
+    # start calculating cat_all for the last 100 iterations
+    total_iterations = n_epochs * len(train_loader)
+    target_iteration = total_iterations - cats if cats is not None else 0
 
     itr = 0
 
 
     for epo in range(n_epochs):
-        model.train()
         for data, target in train_loader:
+            model.train()
             itr += 1
             data, target = data.to(device), target.to(device)
 
@@ -305,12 +274,17 @@ def train_model(n_epochs, train_loader, test_loader, pos_weight, threshold=0.5, 
             loss.backward()
             optimizer.step()
             
-            # if cats is None or itr >= target_iteration:
-            #     with torch.no_grad():
-            #         logits = model(X) # (N,19)
-            #         prob = torch.sigmoid(logits).detach()
-            #         decision = (prob > threshold).float()
-            #         cat_all += decision
+            if cats is None or itr > target_iteration:
+                with torch.no_grad():
+                    model.eval()
+                    logits = model(X)                          # (N, 19), on device
+                    prob = torch.sigmoid(logits).detach()        # keep as tensor, on device
+
+                    threshold = find_best_thresholds(prob.cpu().numpy(), y.cpu().numpy())  # (19,)
+                    threshold_t = torch.as_tensor(threshold, dtype=prob.dtype, device=prob.device)
+
+                    decision = (prob > threshold_t).to(cat_all.dtype)   # stays on device, matches cat_all dtype
+                    cat_all += decision
 
             if itr % 100 == 0:
                 print(f"Epoch: {epo} | Iteration: {itr} | Train Loss: {loss.item()}")
@@ -344,17 +318,15 @@ def train_model(n_epochs, train_loader, test_loader, pos_weight, threshold=0.5, 
     plt.title('Test Loss History')
     plt.savefig('plots/test_loss_history.png')
 
-    # prob = torch.sigmoid(logits).detach()
+    prob = torch.sigmoid(logits).detach()
                     
-    # # Calculate your stability based on the rolling 100-step history (or not)
-    # stab = shanon_stability_multilabel(cat_all, cats, device)
+    # Calculate your stability based on the rolling 100-step history (or not)
+    stab = shanon_stability_multilabel(cat_all, cats)
 
-    # # calculate means and variances for mahalanobis
-    # stats = compute_class_means_and_covariance(model, train_loader, output_dim , device)
+    # calculate means and variances for mahalanobis
+    stats = compute_class_means_and_covariance(model, train_loader, output_dim , device)
 
-    # plot 
-
-    return model#, stab, prob, stats, y#, loss_history
+    return model, stab, prob, stats, y
 
 
 # In[ ]:
@@ -363,18 +335,18 @@ counts = torch.tensor(class_appear_counts.values, dtype=torch.float32)
 pos_weight = torch.log(len(train_imgs) / (counts + 1)).to(device)
 
 print("Start training model")
-model = train_model(30, train_loader, test_loader, pos_weight, cats=100, output_dim=19)
+model, stab, prob, stats, y = train_model(8, train_loader, test_loader, pos_weight, cats=100, output_dim=19)
 
 # In[ ]:
 
 
-torch.save({'model': model}, 'models/model_resnet18_layer4_224x224_30ep.pt')
-# torch.save({'stability': stab}, 'stability_resnet18_layer4_128x128_30ep.pt')
-# torch.save({'prob': prob}, 'sigmoid_resnet18_layer4_128x128_30ep.pt')
-# torch.save({'test_labels': test_labels}, 'test_labels_resnet18_layer4_128x128_30ep.pt')
-# torch.save({'stats': stats}, 'stats_resnet18_layer4_128x128_30ep.pt')
+torch.save({'model': model}, 'models/model_resnet18_224x224_8ep.pt')
+torch.save({'stability': stab}, 'models/stability_resnet18_224x224_8ep.pt')
+torch.save({'prob': prob}, 'models/sigmoid_resnet18_224x224_8ep.pt')
+torch.save({'test_labels': test_labels}, 'models/test_labels_resnet18_224x224_8ep.pt')
+torch.save({'stats': stats}, 'models/stats_resnet18_224x224_8ep.pt')
 
-# 
+
 
 # In[ ]:
 
