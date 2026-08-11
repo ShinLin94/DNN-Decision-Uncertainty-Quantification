@@ -176,7 +176,8 @@ train_indices = X_train.flatten()
 test_indices = X_test.flatten()
 
 # save train and test indices to disk for reproducibility
-torch.save({'train_indices': train_indices, 'test_indices': test_indices}, 'train_test_indices.pt')
+print("save 'train_indices' and 'test_indices'...")
+torch.save({'train_indices': train_indices, 'test_indices': test_indices}, 'models/train_test_indices.pt')
 
 train_imgs, train_labels = all_imgs[train_indices], all_labels[train_indices]
 test_imgs, test_labels = all_imgs[test_indices], all_labels[test_indices]
@@ -249,9 +250,7 @@ def train_model(n_epochs, train_loader, test_loader, pos_weight, threshold=0.5, 
     optimizer = optim.Adam(model.parameters(), lr=5e-5)
     # optimizer = optim.Adam(model.parameters(), lr=5e-4, weight_decay=1e-4)
 
-    X, y = next(iter(test_loader))
-    X, y = X.to(device), y.to(device) 
-    cat_all = torch.zeros(len(X), output_dim).to(device)
+    cat_all = torch.zeros(len(test_loader.dataset), output_dim).to(device)
     loss_history = []
 
     # start calculating cat_all for the last 100 iterations
@@ -259,7 +258,9 @@ def train_model(n_epochs, train_loader, test_loader, pos_weight, threshold=0.5, 
     target_iteration = total_iterations - cats if cats is not None else 0
 
     itr = 0
-
+    logits = torch.empty(len(test_loader.dataset), output_dim, device=device)
+    labels = torch.empty(len(test_loader.dataset), output_dim, device=device)
+    threshold = []
 
     for epo in range(n_epochs):
         for data, target in train_loader:
@@ -277,10 +278,16 @@ def train_model(n_epochs, train_loader, test_loader, pos_weight, threshold=0.5, 
             if cats is None or itr > target_iteration:
                 with torch.no_grad():
                     model.eval()
-                    logits = model(X)                          # (N, 19), on device
+                    start = 0
+                    for X, Y in test_loader:
+                        X, Y = X.to(device), Y.to(device)
+                        end = start + len(X)
+                        logits[start:end] = model(X) # (len(X), 19)
+                        labels[start:end] = Y
+                        start = end
                     prob = torch.sigmoid(logits).detach()        # keep as tensor, on device
 
-                    threshold = find_best_thresholds(prob.cpu().numpy(), y.cpu().numpy())  # (19,)
+                    threshold = find_best_thresholds(prob.cpu().numpy(), labels.cpu().numpy())  # (19,)
                     threshold_t = torch.as_tensor(threshold, dtype=prob.dtype, device=prob.device)
 
                     decision = (prob > threshold_t).to(cat_all.dtype)   # stays on device, matches cat_all dtype
@@ -293,11 +300,11 @@ def train_model(n_epochs, train_loader, test_loader, pos_weight, threshold=0.5, 
         with torch.no_grad():
             model.eval()
             test_loss = 0
-            for data, target in test_loader:
-                data, target = data.to(device), target.to(device)
-                outputs = model(data)
-                loss = criterion(outputs, target)
-                test_loss += loss.item() * data.size(0)
+            for x, y in test_loader:
+                x, y = x.to(device), y.to(device)
+                outputs = model(x)
+                loss = criterion(outputs, y)
+                test_loss += loss.item() * x.size(0)
             test_loss /= len(test_loader.dataset)
             loss_history.append(test_loss)
             print(f"Epoch: {epo} | Test Loss: {test_loss}")
@@ -318,15 +325,16 @@ def train_model(n_epochs, train_loader, test_loader, pos_weight, threshold=0.5, 
     plt.title('Test Loss History')
     plt.savefig('plots/test_loss_history.png')
 
+    print("Calculate probability from sigmoid:")
     prob = torch.sigmoid(logits).detach()
                     
-    # Calculate your stability based on the rolling 100-step history (or not)
-    stab = shanon_stability_multilabel(cat_all, cats)
+    print("Calculate stability based on 100-step history")
+    stab = shannon_stability_multilabel(cat_all, cats)
 
-    # calculate means and variances for mahalanobis
+    print("Calculate means and variances for mahalanobis")
     stats = compute_class_means_and_covariance(model, train_loader, output_dim , device)
 
-    return model, stab, prob, stats, y
+    return model, stab, prob, stats, threshold, labels
 
 
 # In[ ]:
@@ -335,17 +343,25 @@ counts = torch.tensor(class_appear_counts.values, dtype=torch.float32)
 pos_weight = torch.log(len(train_imgs) / (counts + 1)).to(device)
 
 print("Start training model")
-model, stab, prob, stats, y = train_model(8, train_loader, test_loader, pos_weight, cats=100, output_dim=19)
+model, stab, prob, stats, threshold, labels = train_model(8, train_loader, test_loader, pos_weight, cats=100, output_dim=19)
 
 # In[ ]:
 
 
+print("Saving 'model'...")
 torch.save({'model': model}, 'models/model_resnet18_224x224_8ep.pt')
+print("Saving 'stab' for stability from Shannon...")
 torch.save({'stability': stab}, 'models/stability_resnet18_224x224_8ep.pt')
+print("Saving 'prob' from sigmoid...")
 torch.save({'prob': prob}, 'models/sigmoid_resnet18_224x224_8ep.pt')
-torch.save({'test_labels': test_labels}, 'models/test_labels_resnet18_224x224_8ep.pt')
+print("Saving 'test_labels'...")
+torch.save({'test_labels': labels}, 'models/test_labels_resnet18_224x224_8ep.pt')
+print("Saving 'stats' for Mohalanobis...")
 torch.save({'stats': stats}, 'models/stats_resnet18_224x224_8ep.pt')
+print("Saving the 'threshold' for each class...")
+torch.save({'threshold': threshold}, 'models/threshold_resnet18_224x224_8ep.pt')
 
+print("File ran successfully :D")
 
 
 # In[ ]:

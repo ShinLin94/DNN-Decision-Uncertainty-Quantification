@@ -12,18 +12,26 @@ import matplotlib.pyplot as plt
 BASE_DIR = '/gpfs/projects/b1042/AmaralLab/shin/DNN-Decision-Uncertainty-Quantification/models'
 SIGMOID_PATH = f'{BASE_DIR}/sigmoid_resnet18_224x224_8ep.pt'
 LABELS_PATH = f'{BASE_DIR}/test_labels_resnet18_224x224_8ep.pt'
+THRESHOLD_PATH = f'{BASE_DIR}/threshold_resnet18_224x224_8ep.pt'
 NUM_CLASSES = 19
-THRESHOLD = np.array([0.5] * NUM_CLASSES)  # change this for different decision thresholds of the sigmoid output
 
 
-# Load saved probabilities and labels 
-probs = torch.load(SIGMOID_PATH, map_location='cpu')['sigmoid'].numpy()      # (N, 19)
-labels = torch.load(LABELS_PATH, map_location='cpu')['test_labels'].numpy()  # (N, 19)
+# Load saved probabilities and labels
+print("Loading 'prob' from sigmoid, 'test_labels', and 'threshold'...") 
+probs = torch.load(SIGMOID_PATH, map_location='cpu', weights_only=False)['prob'].numpy()      # (N, 19)
+labels = torch.load(LABELS_PATH, map_location='cpu', weights_only=False)['test_labels'].numpy()  # (N, 19)
+threshold = torch.load(THRESHOLD_PATH, map_location='cpu', weights_only=False)['threshold']  # (19,)
  
 print(f"Loaded {probs.shape[0]} test samples, {probs.shape[1]} classes")
+preds = (probs > threshold).astype(np.float32)
 
-THRESHOLD = find_best_threshold(probs, labels)
-preds = (probs > THRESHOLD).astype(np.float32)
+
+print(f"Thresholds: {threshold}")
+print(f"Predictions shape: {preds.shape}, Labels shape: {labels.shape}")
+print(f"Number of positive predictions per class: {preds.sum(axis=0)}")
+print(f"Number of positive labels per class: {labels.sum(axis=0)}")
+print(f"Predictions for first 5 samples:\n{preds[:5]}")
+print(f"Labels for first 5 samples:\n{labels[:5]}")
 
 
 # Overall metrics
@@ -69,5 +77,5 @@ plt.ylabel('F1 Score')
 plt.title('Per-Class F1 Score on Test Set')
 plt.xticks(range(NUM_CLASSES))
 plt.ylim(0, 1)
-plt.savefig(f'{BASE_DIR}/per_class_f1.png')
-print(f"\nSaved per-class F1 plot to {BASE_DIR}/per_class_f1.png")
+plt.savefig(f'{BASE_DIR}/plots/per_class_f1.png')
+print(f"\nSaved per-class F1 plot to {BASE_DIR}/plots/per_class_f1.png")

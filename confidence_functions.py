@@ -1,4 +1,6 @@
 
+import gc
+
 import torch
 from torch import nn
 # from torch import optim
@@ -22,178 +24,28 @@ import torchvision.transforms as T
 
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import f1_score
+from scipy.stats import chi2
 
 IMG_SIZE = 224  
-NORM_MEAN = (0.0, 0.0, 0.0) #
-NORM_STD = (0.0, 0.0, 0.0) # will be computed from training set
+NORM_MEAN = (0.077, 0.046, 0.075)
+NORM_STD = (0.135, 0.097, 0.169)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def find_best_thresholds(probs, labels, thresholds=np.arange(0.05, 0.95, 0.05)):
-    """probs, labels: (N, num_classes) numpy arrays"""
-    best_thresholds = np.zeros(probs.shape[1])
-    for c in range(probs.shape[1]):
-        best_f1, best_t = 0, 0.5
-        for t in thresholds:
-            preds_c = (probs[:, c] > t).astype(int)
-            f1 = f1_score(labels[:, c], preds_c, zero_division=0)
-            if f1 > best_f1:
-                best_f1, best_t = f1, t
-        best_thresholds[c] = best_t
+class CachedCellDataset(Dataset):
+    def __init__(self, images, labels, mean=NORM_MEAN, std=NORM_STD):
+        self.images = images
+        self.labels = labels
+        self.mean = torch.tensor(mean).view(-1, 1, 1)
+        self.std = torch.tensor(std).view(-1, 1, 1)
 
-    # returns best thresholds for each class (output_dim,1)
-    return best_thresholds
+    def __len__(self):
+        return len(self.images)
 
-
-def shanon_stability_multilabel(cat_all, cats):   
-    # cat_all.shape = (len(X), output_dim)
-    # get % of a class being classified as positive for a point
-    cat_all = cat_all / cats
-
-    # stability of each class (binary prob) for each point on grid from Shannon formula (len(X), output_dim)
-    # elementwise mult -> cat_all * torch.log(cat_all + 1e-10) 
-    stabilities = 1 + (cat_all * torch.log(cat_all + 1e-10) + (1 - cat_all) * torch.log(1 - cat_all + 1e-10)) / np.log(2)
-    stability = stabilities.mean(dim=1)
-
-    return stability.detach().cpu().numpy()
-
-def get_features(model, x, layer_types=(nn.GELU, nn.ReLU), detach=True): 
-    """ 
-    Change nn.Linear to switch feature layer to extract (features before activation fn)
-    Or if use other layer types (RELU,GELU,...etc)
-    """
-    features = {}
-    hooks = []
-
-    def make_hook(name):
-        def hook(module, input, output):
-            features[name] = output.detach() if detach else output
-        return hook
-
-    for i, layer in enumerate(model.net):
-        if isinstance(layer, layer_types):
-            hooks.append(layer.register_forward_hook(make_hook(i)))
-
-    if detach:
-        with torch.no_grad():
-            model(x)
-    else:
-        model(x)
-
-    for h in hooks:
-        h.remove()
-
-    if layer_types==(nn.Linear,):
-        keys = sorted(features.keys())
-        selected_keys = keys[1:-1]  # drop first and last layer
-        features = {k: features[k] for k in selected_keys}
-
-    return features
-
-def compute_class_means_and_covariance(model, train_loader, num_classes, device=DEVICE):
-    model.eval()
-    feats_per_layer = {}
-    labels_all = []
-
-    for x, y in train_loader:
-        x = x.to(device)
-        feats = get_features(model, x)  # {layer_idx: [batch, d]}
-        for l, f in feats.items():
-            feats_per_layer.setdefault(l, []).append(f.cpu())
-        labels_all.append(y)
-
-    labels_all = torch.cat(labels_all)
-    stats = {}
-    for l, flist in feats_per_layer.items():
-        f = torch.cat(flist)  # [N, d_l]
-        mu = torch.stack([f[labels_all == c].mean(dim=0) for c in range(num_classes)])
-        centered = torch.cat([f[labels_all == c] - mu[c] for c in range(num_classes)])
-        sigma = (centered.T @ centered) / f.shape[0]
-        stats[l] = {'mu': mu, 'sigma_inv': np.linalg.pinv(sigma)}
-
-    return stats
-
-def compute_alpha(model, X_pos, X_neg, stats, device=DEVICE):
-    """
-    X_indist: [N1, input_dim] in-distribution validation samples
-    X_ood: [N2, input_dim] OOD or adversarial validation samples
-    Returns: alpha, array of length L (layer weights), in sorted(stats.keys()) order
-    """
-    layers = sorted(stats.keys())
-
-    def layer_scores(X):
-        model.eval()
-        with torch.no_grad():
-            feats = get_features(model, X.to(device))
-            scores = []
-            for l in layers:
-                f = feats[l]
-                mu = stats[l]['mu'].to(device)
-                sigma_inv = stats[l]['sigma_inv'].to(device)
-                diff = f.unsqueeze(1) - mu.unsqueeze(0)
-                dist = torch.einsum('bcd,de,bce->bc', diff, sigma_inv, diff)
-                scores.append(-dist.min(dim=1).values)
-            return torch.stack(scores, dim=1).cpu()  # [batch, L]
-
-    scores_in = layer_scores(X_pos)
-    scores_ood = layer_scores(X_neg)
-
-    X_lr = torch.cat([scores_in, scores_ood]).numpy()
-    y_lr = torch.cat([torch.ones(len(scores_in)), torch.zeros(len(scores_ood))]).numpy()
-
-    clf = LogisticRegression()
-    clf.fit(X_lr, y_lr)
-
-    return [clf.coef_.flatten(), clf.intercept_.item()]
-
-
-def mohalanobis(X, model, stats, alpha, device=DEVICE, eps=1e-5):
-    model.eval()
-    # alpha = torch.as_tensor(alpha, dtype=torch.float32)
-
-    # get features of data at every hidden layer
-    feats = get_features(model, X)  # {layer_idx: [x, d]}
-
-    # store confidence at every layer
-    M_l = torch.empty(len(X), len(feats))
-
-    # for each layer, find confidence
-    for i, (l, f) in enumerate(feats.items()):
-        mu = stats[l]['mu'].to(device) # [C, d_l]
-        sigma_inv = stats[l]['sigma_inv'].to(device) # [d_l, d_l]
-
-        # find closest class (max)
-        with torch.no_grad():
-            diff = f.unsqueeze(1) - mu.unsqueeze(0) # [x, C, d_l] 
-            # for each data (x), do 1.d@d.e@e.1 (guass exp M(x)) for all c (classes)
-            dist = torch.einsum('xcd,de,xce->xc', diff, sigma_inv, diff) 
-            closest_c = dist.argmin(dim=1) # [x]
-        
-        # perturb input using gradient of score at closest class
-        if eps > 0:
-            X_in = X.clone().requires_grad_(True)
-            feats_g = get_features(model, X_in, detach=False) # with grad to calc grad
-            f_g = feats_g[l]
-            mu_c = mu[closest_c] # [x, d_l]
-            diff_c = f_g - mu_c
-            score_closest = torch.einsum('xd,de,xe->x', diff_c, sigma_inv, diff_c) # [x]
-            score_closest.sum().backward() # sum so output is scalar (still x diff input variables)
-            X_pert = (X_in - eps * X_in.grad.sign()).detach()
-        else:
-            X_pert = X
-
-        # find the uncertainty using mahalanobis distance of new closest class after perterbation
-        with torch.no_grad():
-            feats_p = get_features(model, X_pert)
-            f_p = feats_p[l]
-            diff_p = f_p.unsqueeze(1) - mu.unsqueeze(0)
-            dist_p = torch.einsum('xcd,de,xce->xc', diff_p, sigma_inv, diff_p) #[x, C]
-            M_l[:,i] = -dist_p.min(dim=1).values # [x, L]
-        
-    final = M_l @ alpha[0] + alpha[1]   # [x]
-    final_prob = torch.sigmoid(final) 
-
-    return final_prob    
+    def __getitem__(self, idx):
+        img = self.images[idx].float() / 255.0
+        img = (img - self.mean) / self.std   # <-- normalization added here
+        return img, self.labels[idx]
 
 
 def compute_dataset_stats(images_uint8_or_float, already_scaled_0_1=False, chunk_size=6000):
@@ -234,6 +86,258 @@ def compute_dataset_stats(images_uint8_or_float, already_scaled_0_1=False, chunk
     std = torch.sqrt(var)
  
     return tuple(mean.float().tolist()), tuple(std.float().tolist())
+
+
+def find_best_thresholds(probs, labels, thresholds=np.arange(0.05, 0.95, 0.05)):
+    """probs, labels: (N, num_classes) numpy arrays"""
+    best_thresholds = np.zeros(probs.shape[1])
+    for c in range(probs.shape[1]):
+        best_f1, best_t = 0, 0.5
+        for t in thresholds:
+            preds_c = (probs[:, c] > t).astype(int)
+            f1 = f1_score(labels[:, c], preds_c, zero_division=0)
+            if f1 > best_f1:
+                best_f1, best_t = f1, t
+        best_thresholds[c] = best_t
+
+    # returns best thresholds for each class (output_dim,1)
+    return best_thresholds
+
+
+def shannon_stability_multilabel(cat_all, cats):   
+    # cat_all.shape = (len(X), output_dim)
+    # get % of a class being classified as positive for a point
+    cat_all = cat_all / cats
+
+    # stability of each class (binary prob) for each point on grid from Shannon formula (len(X), output_dim)
+    # elementwise mult -> cat_all * torch.log(cat_all + 1e-10) 
+    stabilities = 1 + (cat_all * torch.log(cat_all + 1e-10) + (1 - cat_all) * torch.log(1 - cat_all + 1e-10)) / np.log(2)
+    stability = stabilities.mean(dim=1)
+
+    return stability.detach().cpu().numpy()
+
+
+def get_features(model, x, layers=("layer1", "layer2", "layer3", "layer4"),
+                         detach=True):
+    """ Made for resnet:
+    Hooks the output of each named residual stage in `layers` and returns
+    spatially-pooled feature vectors: {layer_name: [batch, channels]}.
+ 
+    model: a torchvision.models.resnet* instance (or anything with attributes
+        matching the names in `layers`, e.g. model.layer1, model.layer2, ...)
+    x: input batch, already on the same device as model
+    layers: names of submodules to hook (default: the 4 standard ResNet stages)
+    detach: if True, runs forward pass under torch.no_grad() and detaches features
+        (use detach=False only if you need gradients through these features,
+        e.g. for adversarial generation against the Mahalanobis score itself)
+    """
+    features = {}
+    hooks = []
+ 
+    def make_hook(name):
+        def hook(module, input, output):
+            # output: [B, C, H, W] -> global average pool -> [B, C]
+            pooled = output.mean(dim=(2, 3))
+            features[name] = pooled.detach() if detach else pooled
+        return hook
+ 
+    for name in layers:
+        layer = getattr(model, name)
+        hooks.append(layer.register_forward_hook(make_hook(name)))
+ 
+    if detach:
+        with torch.no_grad():
+            model(x)
+    else:
+        model(x)
+ 
+    for h in hooks:
+        h.remove()
+ 
+    return features
+ 
+ 
+def compute_class_means_and_covariance(model, train_loader, num_classes,
+                                                device, layers=("layer1", "layer2",
+                                                                 "layer3", "layer4")):
+    """
+    Same role as original compute_class_means_and_covariance from 03...py, but:
+      1. uses get_features_resnet (spatially-pooled conv features) instead of
+         hooking activation layers on a flat nn.Sequential
+      2. handles MULTI-LABEL targets
+ 
+    For multi-label data, "class-conditional" mean/covariance is ambiguous when
+    a sample belongs to multiple classes at once. The standard adaptation (as
+    used in multi-label OOD work) is: for each class c, gather all samples where
+    y[:, c] == 1, and treat that as class c's population -- a sample can
+    contribute to multiple classes' statistics.
+    """
+    model.eval()
+    feats_per_layer = {l: [] for l in layers}
+    labels_all = []
+ 
+    for x, y in train_loader:
+        x = x.to(device)
+        feats = get_features(model, x, layers=layers)
+        for l, f in feats.items():
+            feats_per_layer[l].append(f.cpu())
+        labels_all.append(y.cpu())  # y: [batch, num_classes] multi-hot
+ 
+    labels_all = torch.cat(labels_all)  # [N, num_classes]
+ 
+    stats = {}
+    for l in layers:
+        f = torch.cat(feats_per_layer[l])  # [N, d_l]
+        d = f.shape[1]
+ 
+        mu = torch.zeros(num_classes, d)
+        # accumulate pooled within-class scatter across all classes
+        scatter_sum = torch.zeros(d, d)
+        total_n = 0
+ 
+        for c in range(num_classes):
+            mask = labels_all[:, c] == 1
+            n_c = mask.sum().item()
+            if n_c == 0:
+                # no samples for this class in train_loader -- leave mu[c] as zeros
+                # and skip its contribution to the pooled covariance
+                continue
+            f_c = f[mask]
+            mu[c] = f_c.mean(dim=0)
+            centered = f_c - mu[c]
+            scatter_sum += centered.T @ centered
+            total_n += n_c
+ 
+        sigma = scatter_sum / total_n  # pooled within-class covariance, as in Lee et al.
+        stats[l] = {
+            'mu': mu,
+            'sigma_inv': torch.linalg.pinv(sigma)
+        }
+ 
+    return stats
+
+
+
+
+
+
+
+# def compute_class_means_and_covariance(model, train_loader, num_classes, device=DEVICE):
+#     model.eval()
+#     feats_per_layer = {}
+#     labels_all = []
+
+#     for x, y in train_loader:
+#         x = x.to(device)
+#         feats = get_features(model, x)  # {layer_idx: [batch, d]}
+#         for l, f in feats.items():
+#             feats_per_layer.setdefault(l, []).append(f.cpu())
+#         labels_all.append(y)
+
+#     labels_all = torch.cat(labels_all)
+#     stats = {}
+#     for l, flist in feats_per_layer.items():
+#         f = torch.cat(flist)  # [N, d_l]
+#         mu = torch.stack([f[labels_all == c].mean(dim=0) for c in range(num_classes)])
+#         centered = torch.cat([f[labels_all == c] - mu[c] for c in range(num_classes)])
+#         sigma = (centered.T @ centered) / f.shape[0]
+#         stats[l] = {'mu': mu, 'sigma_inv': torch.linalg.pinv(sigma)}
+
+#     return stats
+
+def compute_alpha(model, X_pos, X_neg, stats, device=DEVICE):
+    """
+    X_indist: [N1, input_dim] in-distribution validation samples
+    X_ood: [N2, input_dim] OOD or adversarial validation samples
+    Returns: alpha, array of length L (layer weights), in sorted(stats.keys()) order
+    """
+    layers = sorted(stats.keys())
+
+    def layer_scores(X):
+        model.eval()
+        with torch.no_grad():
+            feats = get_features(model, X.to(device))
+            scores = []
+            for l in layers:
+                f = feats[l]
+                mu = stats[l]['mu'] # [C, d]   make mu and sigma_inv torch tensors if not already
+                mu = torch.as_tensor(mu, dtype=torch.float32)
+                sigma_inv = stats[l]['sigma_inv'] # [d, d]
+                sigma_inv = torch.as_tensor(sigma_inv, dtype=torch.float32)
+                diff = f.unsqueeze(1) - mu.unsqueeze(0) # bcd - cd
+                dist = torch.einsum('bcd,de,bce->bc', diff, sigma_inv, diff)
+                scores.append(-dist.min(dim=1).values)
+            return torch.stack(scores, dim=1).cpu()  # [batch, L]
+
+    scores_in = layer_scores(X_pos)
+    del X_pos 
+    gc.collect()
+    scores_ood = layer_scores(X_neg)
+    del X_neg
+    gc.collect()
+
+    X_lr = torch.cat([scores_in, scores_ood]).numpy()
+    df = [stats[l]['mu'].to(device).shape[1] for l in layers]
+    X_lr = chi2.cdf(X_lr, df=df)
+    y_lr = torch.cat([torch.ones(len(scores_in)), torch.zeros(len(scores_ood))]).numpy()
+
+    clf = LogisticRegression()
+    clf.fit(X_lr, y_lr)
+
+    return [clf.coef_.flatten(), clf.intercept_.item()]
+
+
+def mahalanobis(X, model, stats, alpha, device=DEVICE, eps=0):
+    model.eval()
+    # alpha = torch.as_tensor(alpha, dtype=torch.float32)
+
+    # get features of data at every hidden layer
+    feats = get_features(model, X)  # {layer_idx: [x, d]}
+
+    # store confidence at every layer
+    M_l = torch.empty(len(X), len(feats))
+
+    # for each layer, find confidence
+    for i, (l, f) in enumerate(feats.items()):
+        mu = stats[l]['mu']
+        mu = torch.as_tensor(mu, dtype=torch.float32).to(device) # [C, d_l]
+        sigma_inv = stats[l]['sigma_inv']
+        sigma_inv = torch.as_tensor(sigma_inv, dtype=torch.float32).to(device) # [d_l, d_l]
+        
+        # find closest class (max)
+        with torch.no_grad():
+            diff = f.unsqueeze(1) - mu.unsqueeze(0) # [x, C, d_l] 
+            # for each data (x), do 1.d@d.e@e.1 (guass exp M(x)) for all c (classes)
+            dist = torch.einsum('xcd,de,xce->xc', diff, sigma_inv, diff) 
+            closest_c = dist.argmin(dim=1) # [x]
+        
+        # perturb input using gradient of score at closest class
+        if eps > 0:
+            X_in = X.clone().requires_grad_(True)
+            feats_g = get_features(model, X_in, detach=False) # with grad to calc grad
+            f_g = feats_g[l]
+            mu_c = mu[closest_c] # [x, d_l]
+            diff_c = f_g - mu_c
+            score_closest = torch.einsum('xd,de,xe->x', diff_c, sigma_inv, diff_c) # [x]
+            score_closest.sum().backward() # sum so output is scalar (still x diff input variables)
+            X_pert = (X_in - eps * X_in.grad.sign()).detach()
+        else:
+            X_pert = X
+
+        # find the uncertainty using mahalanobis distance of new closest class after perterbation
+        with torch.no_grad():
+            feats_p = get_features(model, X_pert)
+            f_p = feats_p[l]
+            diff_p = f_p.unsqueeze(1) - mu.unsqueeze(0)
+            dist_p = torch.einsum('xcd,de,xce->xc', diff_p, sigma_inv, diff_p) #[x, C]
+            M_l[:,i] = -dist_p.min(dim=1).values # [x, L]
+
+    df = [stats[l]['mu'].to(device).shape[1] for l in sorted(stats.keys())]
+    confs = chi2.cdf(M_l, df=df)
+    conf = confs @ alpha[0] + alpha[1]   # [x]
+
+    return conf    # numpy
+
 
 def get_cifar10_ood_loader(root="./data", batch_size=64, train=False,
                             num_workers=2, download=True):
