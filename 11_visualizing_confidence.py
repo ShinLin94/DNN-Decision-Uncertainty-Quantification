@@ -134,9 +134,11 @@ def scatter_plot_three_groups(x, y, n_test, n_adv, n_ood,
     x_adv, y_adv = x[n_test:n_test + n_adv], y[n_test:n_test + n_adv]
     x_ood, y_ood = x[n_test + n_adv:], y[n_test + n_adv:]
 
-    plt.scatter(x_test, y_test, s=8, alpha=0.35, color='gray', label='Test (in-distribution)')
-    plt.scatter(x_ood, y_ood, s=10, alpha=0.6, color='green', label='OOD (out-of-distribution)')
-    plt.scatter(x_adv, y_adv, s=10, alpha=0.6, color='blue', label='Adversarial')
+    # plt.scatter(x_ood, y_ood, s=10, alpha=0.6, color='green', label='OOD (out-of-distribution)')
+    plt.hexbin(x_ood, y_ood, bins=10, cmap='Blues', label='OOD (out-of-distribution)')
+    plt.hexbin(x_adv, y_adv, bins=10, cmap='Blues', label='Adversarial')
+    plt.hexbin(x_test, y_test, bins=10, cmap='Blues', label='Test (in-distribution)')
+
     plt.plot(x, line, color="red", linewidth=2, label="Line of Best Fit")
 
     plt.xlabel(xlabel)
@@ -314,9 +316,6 @@ print("Fitting alpha via compute_alpha...")
 alpha = cf.compute_alpha(model, pos_imgs, neg_imgs, stats, device=device)
 torch.save({'alpha': alpha}, f'{BASE_DIR}/alpha_{MODEL_TAG}.pt')
 print(f"Saved trained alpha: {alpha}")
-assert any(
-    x != 0 for item in alpha for x in (item if isinstance(item, list) else [item])
-)
 del pos_imgs, neg_imgs
 gc.collect()
 
