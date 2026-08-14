@@ -248,7 +248,7 @@ print(f"mean={NORM_MEAN}, std={NORM_STD}")
 
 # Monkey-patch confidence_functions' module-level constants so
 # get_cifar10_ood_loader / get_noise_ood_loader normalize identically to
-# your real training data, regardless of whatever placeholder is currently
+# real training data, regardless of whatever placeholder is currently
 # hardcoded at the top of that file.
 # NORM_MEAN = (0.077, 0.046, 0.075)
 # NORM_STD = (0.135, 0.097, 0.169)
@@ -314,7 +314,7 @@ gc.collect()  # free up memory before next part
 
 print("Fitting alpha via compute_alpha...")
 alpha = cf.compute_alpha(model, pos_imgs, neg_imgs, stats, device=device)
-torch.save({'alpha': alpha}, f'{BASE_DIR}/alpha_{MODEL_TAG}.pt')
+torch.save({'alpha': alpha}, f'{BASE_DIR}/alpha_sig_{MODEL_TAG}.pt')
 print(f"Saved trained alpha: {alpha}")
 del pos_imgs, neg_imgs
 gc.collect()
@@ -433,7 +433,7 @@ for i in range(0, combined_imgs.shape[0], batch_size):
     maha_batch = cf.mahalanobis(batch, model, stats, alpha, device=device)
     maha_combined_list.append(maha_batch)
 maha_combined_np = np.concatenate(maha_combined_list, axis=0)
-torch.save({'maha_combined_np': maha_combined_np}, f'{BASE_DIR}/maha_combined_np_{MODEL_TAG}.pt')
+torch.save({'maha_combined_np': maha_combined_np}, f'{BASE_DIR}/maha_combined_np_sig_{MODEL_TAG}.pt')
 # maha_combined_np = torch.load(f'{BASE_DIR}/maha_combined_np_{MODEL_TAG}.pt', map_location='cpu', weights_only=False)['maha_combined_np']
 
 del combined_imgs, combined_probs, above_mask, maha_combined_list, stability_combined

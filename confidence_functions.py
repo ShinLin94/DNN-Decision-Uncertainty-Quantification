@@ -260,10 +260,8 @@ def compute_alpha(model, X_pos, X_neg, stats, device=DEVICE):
             scores = []
             for l in layers:
                 f = feats[l]
-                mu = stats[l]['mu'] # [C, d]   make mu and sigma_inv torch tensors if not already
-                mu = torch.as_tensor(mu, dtype=torch.float32)
-                sigma_inv = stats[l]['sigma_inv'] # [d, d]
-                sigma_inv = torch.as_tensor(sigma_inv, dtype=torch.float32)
+                mu = torch.as_tensor(stats[l]['mu'], dtype=torch.float32).to(device) # [C, d]   make mu and sigma_inv torch tensors if not already
+                sigma_inv = torch.as_tensor(stats[l]['sigma_inv'], dtype=torch.float32).to(device) # [d, d]
                 diff = f.unsqueeze(1) - mu.unsqueeze(0) # bcd - cd
                 dist = torch.einsum('bcd,de,bce->bc', diff, sigma_inv, diff)
                 scores.append(-dist.min(dim=1).values)
@@ -277,8 +275,8 @@ def compute_alpha(model, X_pos, X_neg, stats, device=DEVICE):
     gc.collect()
 
     X_lr = torch.cat([scores_in, scores_ood]).numpy()
-    df = [stats[l]['mu'].to(device).shape[1] for l in layers]
-    X_lr = chi2.cdf(X_lr, df=df)
+    # df = [stats[l]['mu'].to(device).shape[1] for l in layers]
+    # X_lr = chi2.cdf(X_lr, df=df)
     y_lr = torch.cat([torch.ones(len(scores_in)), torch.zeros(len(scores_ood))]).numpy()
 
     clf = LogisticRegression()
@@ -299,16 +297,18 @@ def mahalanobis(X, model, stats, alpha, device=DEVICE, eps=0):
 
     # for each layer, find confidence
     for i, (l, f) in enumerate(feats.items()):
-        mu = stats[l]['mu']
-        mu = torch.as_tensor(mu, dtype=torch.float32).to(device) # [C, d_l]
-        sigma_inv = stats[l]['sigma_inv']
-        sigma_inv = torch.as_tensor(sigma_inv, dtype=torch.float32).to(device) # [d_l, d_l]
-        
+        mu = torch.as_tensor(stats[l]['mu'], dtype=torch.float32).to(device) # [C, d_l]
+        # print(f"print mu.shape, expect [C, d_l]: {mu.shape}")
+        sigma_inv = torch.as_tensor(stats[l]['sigma_inv'], dtype=torch.float32).to(device) # [d_l, d_l]
+        # print(f"print sigma_inv.shape, expect [d_l, d_l]: {sigma_inv.shape}")
+
         # find closest class (max)
         with torch.no_grad():
             diff = f.unsqueeze(1) - mu.unsqueeze(0) # [x, C, d_l] 
+            # print(f"diff.shape, expect [x, C, d_l] : {diff.shape}")
             # for each data (x), do 1.d@d.e@e.1 (guass exp M(x)) for all c (classes)
-            dist = torch.einsum('xcd,de,xce->xc', diff, sigma_inv, diff) 
+            dist = torch.einsum('xcd,de,xce->xc', diff, sigma_inv, diff) # [x, C]
+            # print(f"dist.shape, expect [x, C] : {dist.shape}")
             closest_c = dist.argmin(dim=1) # [x]
         
         # perturb input using gradient of score at closest class
@@ -321,26 +321,30 @@ def mahalanobis(X, model, stats, alpha, device=DEVICE, eps=0):
             score_closest = torch.einsum('xd,de,xe->x', diff_c, sigma_inv, diff_c) # [x]
             score_closest.sum().backward() # sum so output is scalar (still x diff input variables)
             X_pert = (X_in - eps * X_in.grad.sign()).detach()
+
+            with torch.no_grad():
+                feats_p = get_features(model, X_pert)
+                f_p = feats_p[l]
+                diff_p = f_p.unsqueeze(1) - mu.unsqueeze(0)
+                dist_p = torch.einsum('xcd,de,xce->xc', diff_p, sigma_inv, diff_p) #[x, C]
+                M_l[:,i] = dist_p.min(dim=1).values # [x, L]
         else:
-            X_pert = X
+            M_l[:,i] = -dist.min(dim=1).values  # [x, L]
+            # print(f"dist[closest_c].shape, expect [x]: {M_l[:,i].shape}")
 
-        # find the uncertainty using mahalanobis distance of new closest class after perterbation
-        with torch.no_grad():
-            feats_p = get_features(model, X_pert)
-            f_p = feats_p[l]
-            diff_p = f_p.unsqueeze(1) - mu.unsqueeze(0)
-            dist_p = torch.einsum('xcd,de,xce->xc', diff_p, sigma_inv, diff_p) #[x, C]
-            M_l[:,i] = -dist_p.min(dim=1).values # [x, L]
-
-    df = [stats[l]['mu'].to(device).shape[1] for l in sorted(stats.keys())]
-    confs = chi2.cdf(M_l, df=df)
-    conf = confs @ alpha[0] + alpha[1]   # [x]
+    # print(f"print the maha dist of all layers for first image M_l[:,0]: {M_l[:,0]}")
+    # print(f"print the min number of all vales in M_l, should be greater than 0: {M_l.min()}")
+    # df = [stats[l]['mu'].to(device).shape[1] for l in sorted(stats.keys())]
+    # confs = chi2.cdf(M_l, df=df) # probability 
+    # conf = confs @ alpha[0] + alpha[1]   # [x] linear transform of prob, not prob itself
+    conf = M_l @ alpha[0] + alpha[1]
+    conf = torch.sigmoid(torch.as_tensor(conf))  # now a prob again
 
     return conf    # numpy
 
 
 def get_cifar10_ood_loader(root="./data", batch_size=64, train=False,
-                            num_workers=2, download=True):
+                            num_workers=2, download=True, trans=True):
     """
     Loads CIFAR-10 resized/normalized to match the in-distribution HPA pipeline.
     Returns a DataLoader yielding (image, label) — label is CIFAR's class id,
@@ -352,12 +356,17 @@ def get_cifar10_ood_loader(root="./data", batch_size=64, train=False,
         T.Normalize(mean=NORM_MEAN, std=NORM_STD),
     ])
 
-    dataset = torchvision.datasets.CIFAR10(
-        root=root, train=train, download=download, transform=transform
-    )
-
-    return DataLoader(dataset, batch_size=batch_size, shuffle=False,
-                       num_workers=num_workers, pin_memory=True)
+    if trans==True:
+        dataset = torchvision.datasets.CIFAR10(
+            root=root, train=train, download=download, transform=transform
+        )
+        return DataLoader(dataset, batch_size=batch_size, shuffle=False,
+                               num_workers=num_workers, pin_memory=True)
+    else:
+        dataset = torchvision.datasets.CIFAR10(
+                    root=root, train=train, download=download
+                )
+        return dataset
 
 
 class NoiseDataset(Dataset):
